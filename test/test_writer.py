@@ -12,6 +12,7 @@ from . import get_test_file
 
 from io import BytesIO
 from collections import OrderedDict
+import gzip
 import json
 import re
 
@@ -843,4 +844,133 @@ Content-Length: {0}\r\n\
             assert new_rec.length == record.length
             assert new_rec.http_headers == record.http_headers
             assert new_rec.raw_stream.read() == payload
+
+    # ==================================================================
+    # Segmented (WARC 1.1) records
+    # ==================================================================
+    def _segmented_response_record(self, writer, payload=b'0123456789abcdef' * 20):
+        http_headers = StatusAndHeaders('200 OK',
+            [('Content-Type', 'text/plain'),
+             ('Content-Length', str(len(payload)))],
+            protocol='HTTP/1.0')
+        record = writer.create_warc_record('http://example.com/', 'response',
+                                           payload=BytesIO(payload),
+                                           length=len(payload),
+                                           http_headers=http_headers)
+        return record, http_headers, payload
+
+    def test_write_segmented_record(self, is_gzip):
+        writer = BufferWARCWriter(gzip=is_gzip)
+        record, http_headers, payload = self._segmented_response_record(writer)
+        writer.write_segmented_record(record, 100)
+
+        data = writer.get_contents()
+
+        # inspect the physical (uncompressed) segments
+        plain = gzip.decompress(data) if is_gzip else data
+
+        # block = 66 bytes of HTTP headers + 320 bytes payload, so the
+        # segments hold 100, 100, 100 and 86 bytes of content block
+        assert plain.count(b'WARC-Type: continuation\r\n') == 3
+        segment_numbers = re.findall(rb'WARC-Segment-Number: (\d+)\r\n', plain)
+        assert segment_numbers == [b'1', b'2', b'3', b'4']
+
+        first_id = re.search(rb'WARC-Record-ID: (<[^>]+>)\r\n', plain).group(1)
+        origin_ids = re.findall(rb'WARC-Segment-Origin-ID: (<[^>]+>)\r\n', plain)
+        assert origin_ids == [first_id] * 3
+
+        # continuation record ids are distinct and differ from the first
+        cont_ids = re.findall(rb'WARC-Type: continuation\r\n'
+                              rb'WARC-Record-ID: (<[^>]+>)\r\n', plain)
+        assert len(set(cont_ids)) == 3 and first_id not in cont_ids
+
+        # all continuations share the first segment's WARC-Date, carry a
+        # block digest but no payload digest
+        dates = set(re.findall(rb'WARC-Date: ([^\r\n]+)\r\n', plain))
+        assert len(dates) == 1
+        assert b'WARC-Payload-Digest:' not in plain.split(b'WARC-Type: continuation', 1)[1]
+        assert len(re.findall(rb'WARC-Block-Digest:', plain)) == 4
+
+        # only the last segment carries the total length
+        totals = re.findall(rb'WARC-Segment-Total-Length: (\d+)\r\n', plain)
+        assert totals == [b'386']
+
+        # with gzip, each segment is a separate gzip member
+        if is_gzip:
+            assert data.count(b'\x1f\x8b') == 4
+
+        # the segments merge back into the single original record
+        records = list(ArchiveIterator(BytesIO(data), check_digests=True))
+        assert len(records) == 1
+        merged = records[0]
+        assert merged.rec_type == 'response'
+        assert merged.http_headers == http_headers
+        assert merged.content_stream().read() == payload
+        assert merged.length == 386
+        assert merged.rec_headers.get_header('WARC-Record-ID') == first_id.decode('ascii')
+        assert merged.rec_headers.get_header('WARC-Segment-Number') is None
+        assert merged.rec_headers.get_header('WARC-Block-Digest') is None
+        assert merged.rec_headers.get_header('WARC-Segment-Total-Length') is None
+        assert merged.digest_checker.passed is True
+
+    def test_write_segmented_small_record(self, is_gzip):
+        """ a block not exceeding max_segment_size is written just like
+        write_record, as one ordinary record """
+        writer1 = FixedTestWARCWriter(gzip=is_gzip)
+        writer2 = FixedTestWARCWriter(gzip=is_gzip)
+
+        r1 = sample_response(writer1)
+        r2 = sample_response(writer2)
+
+        writer1.write_record(r1)
+        writer2.write_segmented_record(r2, 100000)
+
+        assert writer1.get_contents() == writer2.get_contents()
+
+    def test_write_segmented_too_small(self):
+        """ HTTP headers plus one body byte must fit in the first segment,
+        otherwise ValueError is raised and nothing is written """
+        writer = BufferWARCWriter(gzip=False)
+        record, http_headers, payload = self._segmented_response_record(writer)
+
+        with pytest.raises(ValueError):
+            writer.write_segmented_record(record, 50)
+
+        assert writer.get_contents() == b''
+
+        # headerless record with a non-positive size fails as well
+        resource = writer.create_warc_record('dns:example.com', 'resource',
+                                             payload=BytesIO(b'abc'),
+                                             length=3,
+                                             warc_content_type='text/plain')
+        writer2 = BufferWARCWriter(gzip=False)
+        with pytest.raises(ValueError):
+            writer2.write_segmented_record(resource, 0)
+        assert writer2.get_contents() == b''
+
+    def test_write_segmented_resource(self, is_gzip):
+        """ a record without HTTP headers is split on payload boundaries """
+        payload = b'R' * 500
+        writer = BufferWARCWriter(gzip=is_gzip)
+        record = writer.create_warc_record('dns:example.com', 'resource',
+                                           payload=BytesIO(payload),
+                                           length=len(payload),
+                                           warc_content_type='text/dns')
+        writer.write_segmented_record(record, 200)
+
+        data = writer.get_contents()
+        plain = gzip.decompress(data) if is_gzip else data
+        assert re.findall(rb'WARC-Segment-Number: (\d+)\r\n', plain) == [b'1', b'2', b'3']
+        assert re.findall(rb'Content-Length: (\d+)\r\n', plain) == [b'200', b'200', b'100']
+        assert re.findall(rb'WARC-Segment-Total-Length: (\d+)\r\n', plain) == [b'500']
+
+        records = list(ArchiveIterator(BytesIO(data),
+                                       check_digests=True))
+        assert len(records) == 1
+        merged = records[0]
+        assert merged.rec_type == 'resource'
+        assert merged.length == 500
+        assert merged.content_stream().read() == payload
+        assert merged.digest_checker.passed is True
+
 

@@ -50,7 +50,10 @@ class DigestVerifyingReader(LimitReader):
         if record_type == 'revisit':
             block_digest = None
             payload_digest = None
-        if segment_number is not None:  #pragma: no cover
+        if segment_number is not None:
+            # a segment of a segmented record: the payload digest, if
+            # any, applies to the reassembled payload, not to this
+            # segment's block
             payload_digest = None
 
         self.payload_digest = payload_digest

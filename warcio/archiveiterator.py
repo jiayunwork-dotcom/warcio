@@ -1,7 +1,10 @@
+from io import BytesIO
+
 from warcio.bufferedreaders import DecompressingBufferedReader
 
 from warcio.exceptions import ArchiveLoadFailed
 from warcio.recordloader import ArcWarcRecordLoader
+from warcio.statusandheaders import StatusAndHeaders
 
 from warcio.utils import BUFF_SIZE
 
@@ -21,6 +24,32 @@ class UnseekableYetTellable:
         result = self.fh.read(size)
         self.offset += len(result)
         return result
+
+# ============================================================================
+class PendingSegmentedRecord(object):
+    """ Holds the physical records (and their content block bytes) of
+    a segmented record series whose final segment has not been seen yet.
+    """
+
+    def __init__(self, first_record, first_block, member_info):
+        self.first_record = first_record
+        self.blocks = [first_block]
+        self.records = [first_record]
+        self.member_info = member_info
+
+    def add(self, record, block):
+        self.records.append(record)
+        self.blocks.append(block)
+
+    def content_length_sum(self):
+        total = 0
+        for record in self.records:
+            total += int(record.rec_headers.get_header('Content-Length'))
+        return total
+
+    def digest_checkers(self):
+        return [record.digest_checker for record in self.records
+                if record.digest_checker is not None]
 
 # ============================================================================
 class ArchiveIterator(six.Iterator):
@@ -105,13 +134,47 @@ class ArchiveIterator(six.Iterator):
         raise_invalid_gzip = False
         empty_record = False
 
+        # incomplete segmented record series, keyed by the first
+        # segment's WARC-Record-ID (the continuations'
+        # WARC-Segment-Origin-ID)
+        pending_segments = {}
+
         while True:
             try:
                 self.record = self._next_record(self.next_line)
                 if raise_invalid_gzip:
                     self._raise_invalid_gzip_err()
 
-                yield self.record
+                kind, key = self._classify_segment(self.record)
+
+                if kind == 'segment-first':
+                    # buffer the first segment, it is not yielded on its own
+                    block = self._read_record_block(self.record)
+                    self.read_to_end()
+                    pending_segments[key] = PendingSegmentedRecord(
+                        self.record, block, self.member_info)
+
+                elif kind == 'segment-continuation' and key in pending_segments:
+                    # part of a known segmented record series
+                    block = self._read_record_block(self.record)
+                    self.read_to_end()
+
+                    series = pending_segments[key]
+                    series.add(self.record, block)
+
+                    if self.record.rec_headers.get_header(
+                            'WARC-Segment-Total-Length') is not None:
+                        # final segment: merge the whole series
+                        del pending_segments[key]
+                        self.record = self._merge_segmented_record(series)
+                        # the merged record is located at the first segment
+                        self.member_info = series.member_info
+                        yield self.record
+
+                else:
+                    # ordinary record, or an orphan continuation whose
+                    # first segment is not in this stream: yield as-is
+                    yield self.record
 
             except EOFError:
                 empty_record = True
@@ -268,6 +331,103 @@ class ArchiveIterator(six.Iterator):
             self.known_format = record.format
 
         return record
+
+    def _classify_segment(self, record):
+        """ Determine whether a physical record is part of a segmented
+        record series.
+
+        Returns ('segment-first', record-id) for the first segment,
+        ('segment-continuation', origin-id) for a continuation record
+        and (None, None) for ordinary records (including continuation
+        records whose first segment is not in this stream).
+        """
+        origin_id = record.rec_headers.get_header('WARC-Segment-Origin-ID')
+        if record.rec_type == 'continuation' and origin_id:
+            return 'segment-continuation', origin_id
+
+        if record.rec_headers.get_header('WARC-Segment-Number') is not None:
+            record_id = record.rec_headers.get_header('WARC-Record-ID')
+            return 'segment-first', record_id
+
+        return None, None
+
+    @staticmethod
+    def _read_record_block(record):
+        """ Read the complete content block of a physical record into
+        memory. Reading the block also triggers the per-segment block
+        digest verification.
+        """
+        if record.http_headers:
+            # the HTTP headers have already been consumed from
+            # raw_stream, re-add their serialized form
+            if not record.http_headers.headers_buff:
+                record.http_headers.compute_headers_buffer()
+            return record.http_headers.headers_buff + record.raw_stream.read()
+
+        return record.raw_stream.read()
+
+    def _merge_segmented_record(self, series):
+        """ Merge a completed segmented record series into a single
+        ArcWarcRecord, using the first segment's headers and the
+        concatenated content blocks of all segments.
+        """
+        final_record = series.records[-1]
+        declared_length = final_record.rec_headers.get_header(
+            'WARC-Segment-Total-Length')
+
+        try:
+            declared_length = int(declared_length)
+        except (TypeError, ValueError):
+            raise ArchiveLoadFailed(
+                'Invalid WARC-Segment-Total-Length: {0}'.format(
+                    declared_length))
+
+        actual_length = series.content_length_sum()
+        if declared_length != actual_length:
+            first_id = series.first_record.rec_headers.get_header(
+                'WARC-Record-ID')
+            raise ArchiveLoadFailed(
+                'Segmented record {0}: sum of segment lengths {1} does '
+                'not match WARC-Segment-Total-Length {2}'.format(
+                    first_id, actual_length, declared_length))
+
+        first_headers = series.first_record.rec_headers
+        # merged record uses the first segment's headers, without the
+        # segmentation marker and the per-segment block digest
+        rec_headers = StatusAndHeaders(first_headers.statusline,
+                                       list(first_headers.headers),
+                                       protocol=first_headers.protocol)
+        rec_headers.remove_header('WARC-Segment-Number')
+        rec_headers.remove_header('WARC-Block-Digest')
+        rec_headers.replace_header('Content-Length', str(actual_length))
+
+        block = b''.join(series.blocks)
+
+        # re-parse the assembled record so that HTTP headers and digests
+        # are handled exactly as for ordinary records
+        stream = BytesIO(rec_headers.to_bytes(encoding='utf-8') +
+                         block + b'\r\n\r\n')
+
+        merged = self.loader.parse_record_stream(
+            stream,
+            known_format='warc',
+            no_record_parse=self.no_record_parse,
+            ensure_http_headers=self.ensure_http_headers,
+            check_digests=self.check_digests)
+
+        self._combine_segment_digest_results(merged, series)
+
+        return merged
+
+    @staticmethod
+    def _combine_segment_digest_results(merged, series):
+        """ Propagate block digest failures of the individual segments
+        onto the merged record's digest checker.
+        """
+        for checker in series.digest_checkers():
+            if checker.passed is False:
+                merged.digest_checker._problem.extend(checker.problems)
+                merged.digest_checker._passed = False
 
 
 # ============================================================================

@@ -67,6 +67,49 @@ def test_index_2(capsys):
     assert capsys.readouterr().out == expected
 
 
+def test_index_segmented(capsys):
+    # a segmented record series is indexed as a single entry whose
+    # offset is the offset of the first segment
+    import json
+    from io import BytesIO
+    from warcio.warcwriter import BufferWARCWriter
+    from warcio.statusandheaders import StatusAndHeaders
+
+    writer = BufferWARCWriter(gzip=False)
+    payload = b'A' * 200
+    http_headers = StatusAndHeaders('200 OK',
+        [('Content-Type', 'text/plain')], protocol='HTTP/1.0')
+    record = writer.create_warc_record('http://example.com/seg', 'response',
+                                       payload=BytesIO(payload),
+                                       length=len(payload),
+                                       http_headers=http_headers)
+    writer.write_segmented_record(record, 80)
+
+    plain = writer.create_warc_record('http://example.com/plain', 'resource',
+                                      payload=BytesIO(b'hi'), length=2,
+                                      warc_content_type='text/plain')
+    writer.write_record(plain)
+
+    with tempfile.NamedTemporaryFile(suffix='.warc', delete=False) as temp:
+        temp.write(writer.get_contents())
+        temp_filename = temp.name
+
+    try:
+        main(args=['index', '-f',
+                   'offset,length,warc-type,warc-target-uri',
+                   temp_filename])
+    finally:
+        os.unlink(temp_filename)
+
+    rows = [json.loads(line) for line in
+            capsys.readouterr().out.splitlines()]
+    assert len(rows) == 2
+    assert rows[0]['warc-type'] == 'response'
+    assert rows[0]['offset'] == '0'
+    assert rows[0]['warc-target-uri'] == 'http://example.com/seg'
+    assert rows[1]['warc-type'] == 'resource'
+
+
 
 def test_check_valid(capsys):
     filenames = [get_test_file('example.warc'), get_test_file('example.warc.gz')]

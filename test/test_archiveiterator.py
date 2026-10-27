@@ -7,6 +7,7 @@ from warcio.statusandheaders import StatusAndHeaders
 
 import pytest
 import gzip
+import re
 from io import BytesIO
 import sys
 
@@ -377,3 +378,215 @@ Content-Length: 1303\r\n'
         # record 2: b64 digest; record 3: b64 filename safe digest
         assert self._load_archive('example-digest.warc', offset=922, check_digests=True) == expected_t
         assert self._load_archive('example-digest.warc', offset=922, check_digests=False) == expected_t
+
+
+#==============================================================================
+# Segmented (WARC 1.1) records
+#==============================================================================
+def _write_series(uri, payload, max_segment_size, rec_type='response',
+                 gzip=False):
+    writer = BufferWARCWriter(gzip=gzip)
+    if rec_type == 'response':
+        http_headers = StatusAndHeaders('200 OK',
+            [('Content-Type', 'text/plain'),
+             ('Content-Length', str(len(payload)))],
+            protocol='HTTP/1.0')
+    else:
+        http_headers = None
+    record = writer.create_warc_record(uri, rec_type,
+                                       payload=BytesIO(payload),
+                                       length=len(payload),
+                                       http_headers=http_headers,
+                                       warc_content_type='text/plain')
+    writer.write_segmented_record(record, max_segment_size)
+    return writer.get_contents()
+
+
+def _split_physical_records(data):
+    """ Split an uncompressed WARC containing simple segmented test
+    records into its physical records. """
+    parts = []
+    start = 0
+    while True:
+        idx = data.find(b'WARC/1.0', start + 1)
+        if idx == -1:
+            parts.append(data[start:])
+            break
+        parts.append(data[start:idx])
+        start = idx
+    return parts
+
+
+def _write_resource_record(uri, payload):
+    writer = BufferWARCWriter(gzip=False)
+    record = writer.create_warc_record(uri, 'resource',
+                                       payload=BytesIO(payload),
+                                       length=len(payload),
+                                       warc_content_type='text/plain')
+    writer.write_record(record)
+    return writer.get_contents()
+
+
+class TestSegmentedRecords(object):
+    def test_merged_basic(self):
+        payload = b'A' * 200
+        data = _write_series('http://a.example/', payload, 80)
+        parts = _split_physical_records(data)
+        assert len(parts) == 4
+
+        records = list(ArchiveIterator(BytesIO(data)))
+        assert len(records) == 1
+        merged = records[0]
+        assert merged.rec_type == 'response'
+        assert merged.length == sum(
+            int(re.search(rb'Content-Length: (\d+)\r\n', p).group(1))
+            for p in parts)
+        assert merged.rec_headers.get_header('WARC-Segment-Number') is None
+        assert merged.rec_headers.get_header('WARC-Block-Digest') is None
+        assert merged.rec_headers.get_header('WARC-Segment-Origin-ID') is None
+        assert merged.rec_headers.get_header('WARC-Payload-Digest') is not None
+        assert merged.content_stream().read() == payload
+
+    def test_merged_gzip(self):
+        payload = b'segmented gzip payload\n' * 20
+        data = _write_series('http://a.example/', payload, 100, gzip=True)
+
+        records = list(ArchiveIterator(BytesIO(data), check_digests=True))
+        assert len(records) == 1
+        merged = records[0]
+        assert merged.content_stream().read() == payload
+        assert merged.digest_checker.passed is True
+
+    def test_interleaved_series_and_records(self):
+        """ Segments of two series may be interleaved with each other and
+        with ordinary records; the merged records come out when the final
+        segment of their series is seen, located at the first segment. """
+        payload_a = b'A' * 200
+        payload_b = b'B' * 100
+
+        a_parts = _split_physical_records(
+            _write_series('http://a.example/', payload_a, 80))
+        b_parts = _split_physical_records(
+            _write_series('http://b.example/', payload_b, 60,
+                          rec_type='resource'))
+        x_record = _write_resource_record('http://x.example/', b'X' * 10)
+
+        assert len(a_parts) == 4 and len(b_parts) == 2
+
+        # A1, X, B1, A2, B2(final), A3, A4(final)
+        stream = (a_parts[0] + x_record + b_parts[0] + a_parts[1] +
+                  b_parts[1] + a_parts[2] + a_parts[3])
+
+        it = ArchiveIterator(BytesIO(stream))
+        seen = []
+        for record in it:
+            uri = record.rec_headers.get_header('WARC-Target-URI')
+            if uri == 'http://x.example/':
+                # read the standalone record before get_record_offset()
+                # drains its stream
+                assert record.rec_type == 'resource'
+                assert record.content_stream().read() == b'X' * 10
+            seen.append((record.rec_type, uri, it.get_record_offset()))
+
+        uris = [uri for _, uri, _ in seen]
+        assert uris == ['http://x.example/',
+                        'http://b.example/',
+                        'http://a.example/']
+
+        assert seen[0][2] == len(a_parts[0])
+        assert seen[1][2] == len(a_parts[0]) + len(x_record)
+        assert seen[2][2] == 0
+
+        # payloads of the merged records are complete
+        merged_a = ArchiveIterator(BytesIO(stream))
+        records = list(merged_a)
+        # standalone X was drained by read_to_end(), but merged records
+        # keep their in-memory streams
+        merged_b = records[1]
+        merged_a_rec = records[2]
+        assert merged_b.content_stream().read() == payload_b
+        assert merged_a_rec.content_stream().read() == payload_a
+
+    def test_orphan_continuation(self):
+        """ A continuation whose first segment is absent is yielded
+        unchanged. """
+        data = _write_series('http://a.example/', b'A' * 200, 80)
+        parts = _split_physical_records(data)
+
+        # middle continuation with no matching first segment
+        records = list(ArchiveIterator(BytesIO(parts[1])))
+        assert len(records) == 1
+        assert records[0].rec_type == 'continuation'
+        assert records[0].rec_headers.get_header('WARC-Segment-Number') == '2'
+
+        # final continuation (has WARC-Segment-Total-Length) is also
+        # yielded as-is when the origin record is unknown
+        records = list(ArchiveIterator(BytesIO(parts[-1])))
+        assert len(records) == 1
+        assert records[0].rec_type == 'continuation'
+        assert records[0].rec_headers.get_header(
+            'WARC-Segment-Total-Length') is not None
+
+    def test_total_length_mismatch(self):
+        data = _write_series('http://a.example/', b'A' * 200, 80)
+        bad = re.sub(rb'WARC-Segment-Total-Length: \d+',
+                     b'WARC-Segment-Total-Length: 199', data, count=1)
+        assert bad != data
+
+        with pytest.raises(ArchiveLoadFailed):
+            list(ArchiveIterator(BytesIO(bad)))
+
+    def test_per_segment_block_digest_failure(self):
+        data = _write_series('http://a.example/', b'A' * 200, 80)
+
+        # mangle the block digest on a continuation
+        bad = bytearray(data)
+        positions = [m.start() for m in
+                     re.finditer(rb'WARC-Block-Digest: sha1:', bytes(bad))]
+        p = positions[2] + len(b'WARC-Block-Digest: sha1:')
+        bad[p:p + 3] = b'ZZZ'
+
+        records = list(ArchiveIterator(BytesIO(bytes(bad)),
+                                       check_digests=True))
+        merged = records[0]
+        assert merged.content_stream().read() == b'A' * 200
+        assert merged.digest_checker.passed is False
+        assert any('block digest failed' in problem
+                   for problem in merged.digest_checker.problems)
+
+        # check disabled: not evaluated
+        merged = list(ArchiveIterator(BytesIO(bytes(bad)),
+                                      check_digests=False))[0]
+        assert merged.digest_checker.passed is None
+
+        # raise mode: ArchiveLoadFailed
+        with pytest.raises(ArchiveLoadFailed):
+            for record in ArchiveIterator(BytesIO(bytes(bad)),
+                                          check_digests='raise'):
+                record.content_stream().read()
+
+    def test_payload_digest_failure(self):
+        data = _write_series('http://a.example/', b'A' * 200, 80)
+
+        bad = bytearray(data)
+        p = bad.find(b'WARC-Payload-Digest: sha1:') + \
+            len(b'WARC-Payload-Digest: sha1:')
+        bad[p:p + 3] = b'QQQ'
+
+        merged = list(ArchiveIterator(BytesIO(bytes(bad)),
+                                      check_digests=True))[0]
+        assert merged.content_stream().read() == b'A' * 200
+        assert merged.digest_checker.passed is False
+        assert any('payload digest failed' in problem
+                   for problem in merged.digest_checker.problems)
+
+    def test_no_record_parse(self):
+        data = _write_series('http://a.example/', b'A' * 200, 80)
+        merged = list(ArchiveIterator(BytesIO(data),
+                                      no_record_parse=True))[0]
+        assert merged.http_headers is None
+        assert merged.length == 266
+        assert merged.raw_stream.read() == \
+            b'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n' \
+            b'Content-Length: 200\r\n\r\n' + b'A' * 200
+
